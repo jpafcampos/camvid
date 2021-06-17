@@ -291,7 +291,7 @@ def train(model, train_dataloader, val_dataloader,device, criterion, optimizer, 
         train_loss = 0
         model.train()
         # Step Loop
-        for step in tqdm(range(train_step_size)):
+        for i in range(train_step_size):
         	x_batch, y_batch = next(iter(train_dataloader))
         	x_batch = x_batch.squeeze().to(device)
         	y_batch = y_batch.squeeze().to(device)
@@ -332,21 +332,28 @@ def train(model, train_dataloader, val_dataloader,device, criterion, optimizer, 
         )
     )
     return train_loss_history, val_loss_history 
+
+
 def main():
 
+    print("checking device", "cuda:"+str(gpu_id))
     device = torch.device("cuda:"+str(gpu_id) if torch.cuda.is_available() else "cpu")
+    print("using DEVICE", device)
 
     train_images = sorted(glob('/local/DEEPLEARNING/camvid/train/*'))
     train_labels = sorted(glob('/local/DEEPLEARNING/camvid/trainannot/*'))
     val_images = sorted(glob('/local/DEEPLEARNING/camvid/val/*'))
     val_labels = sorted(glob('/local/DEEPLEARNING/camvid/valannot/*'))
-    test_images = sorted(glob('/local/DEEPLEARNING/camvidtest/*'))
-    test_labels = sorted(glob('/local/DEEPLEARNING/camvidtestannot/*'))
+    test_images = sorted(glob('/local/DEEPLEARNING/camvid/test/*'))
+    test_labels = sorted(glob('/local/DEEPLEARNING/camvid/testannot/*'))
     batch_size = 10
 
     train_dataset = CamVidDataset(train_images, train_labels, 512, 512)
+    print("length train", train_dataset.__len__())
     val_dataset = CamVidDataset(val_images, val_labels, 512, 512)
+    print("length val", val_dataset.__len__())
     test_dataset = CamVidDataset(test_images, test_labels, 512, 512)
+    print("length test", test_dataset.__len__())
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
@@ -355,9 +362,10 @@ def main():
 
     resnet50 = models.resnet50(pretrained=True)
     resnet50_backbone = models._utils.IntermediateLayerGetter(resnet50, {'layer1': 'feat1', 'layer2': 'feat2', 'layer3': 'feat3', 'layer4': 'feat4'})
-    model = resvit.ResViT(pretrained_net=resnet50_backbone, num_class=12, dim=768, depth=1, heads=1, mlp_dim=3072, batch_size = batch_size, trans_img_size=(45,60), feat = "feat2")
+    model = resvit.ResViT(pretrained_net=resnet50_backbone, num_class=12, dim=768, depth=1, heads=1, batch_size = batch_size, trans_img_size=(45,60))
     print("created resvit model")
-
+    model.to(device)
+    print("model put into ", device)
     class_weights = get_class_weights(train_loader, 12)
     criterion = CrossEntropyLoss(weight=torch.FloatTensor(class_weights).to(device))
     optimizer = Adam(
@@ -379,6 +387,14 @@ def main():
     metrics = StreamSegMetrics(12)
     score = validate(model, test_loader, device, metrics)
     print(metrics.to_str(score))
+
+    plt.figure(figsize=(20,10))
+    plt.plot(train_loss_history)
+    plt.xlabel("Time")
+    plt.ylabel("Loss")
+    plt.title("Loss function evolution")
+    plt.savefig('loss_train.png')
+
 
 
 if __name__ == '__main__':

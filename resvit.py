@@ -13,6 +13,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 import random
+import vit
 
 class ResViT(nn.Module):
 
@@ -24,7 +25,7 @@ class ResViT(nn.Module):
         self.batch_size = batch_size
         self.trans_img_size = trans_img_size
         #Transformer unit (encoder)
-        self.transformer = ViT(
+        self.transformer = vit.ViT(
             image_size = trans_img_size,
             patch_size = 1,
             num_classes = 64, #not used
