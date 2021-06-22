@@ -34,7 +34,7 @@ from torch.nn import CrossEntropyLoss
 import line_profiler
 
 batch_size = 10
-gpu_id = 2
+gpu_id = 3
 lr = 0.01
 wd = 0.0005
 epochs = 700

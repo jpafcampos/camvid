@@ -50,9 +50,9 @@ class Setr(nn.Module):
     def forward(self, x):   
         bs = x.size(0)     
         score = self.vit_backbone(x)
-        print(score.size())
+        #print(score.size())
         score = torch.reshape(score, (bs, 24, 24, 768))
-        print(score.size())
+        #print(score.size())
         score = score.view(
             score.size(0),
             24,
@@ -61,7 +61,7 @@ class Setr(nn.Module):
         )
         score = score.permute(0, 3, 1, 2).contiguous()
         #score = torch.transpose(score, 1, 3)
-        print(score.size())
+        #print(score.size())
 
         score = self.up1(self.bn1(self.relu(self.deconv1(score))))    
         score = self.up2(self.bn2(self.relu(self.deconv2(score)))) 
