@@ -2,10 +2,13 @@ from __future__ import print_function
 import os
 import os.path as osp
 import copy
+import timm
 import torch
 from torch import einsum
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+import torchvision.transforms as T
 import torch.optim as optim
 from torchvision import models
 import numpy as np
@@ -24,14 +27,18 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import ToTensor, ToPILImage
 import vit
 import resvit
+import setr
 
-from torch.optim import Adam
+from torch.optim import Adam, SGD
 from torch.nn import CrossEntropyLoss
+import line_profiler
 
+batch_size = 10
 gpu_id = 2
 lr = 0.01
 wd = 0.0005
 epochs = 700
+model_name = "setr"
 
 import numpy as np
 from sklearn.metrics import confusion_matrix
@@ -144,7 +151,7 @@ class AverageMeter(object):
         assert record is not None
         return record[0] / record[1]
 
-
+#@profile
 def validate(model, loader, device, metrics, save_val_results = False):
     """Do validation"""
     metrics.reset()
@@ -200,31 +207,60 @@ def validate(model, loader, device, metrics, save_val_results = False):
         score = metrics.get_results()
     return score
 
+
 class CamVidDataset(Dataset):
 
-	def __init__(self, images, labels, height, width):
-		self.images = images
-		self.labels = labels
-		self.height = height
-		self.width = width
-	
-	def __len__(self):
-		return len(self.images)
-	
-	def __getitem__(self, index):
-		image_id = self.images[index]
-		label_id = self.labels[index]
-		# Read Image
-		x = Image.open(image_id)
-		x = [np.array(x)]
-		x = np.stack(x, axis=2)
-		x = torch.tensor(x).transpose(0, 2).transpose(1, 3) # Convert to N, C, H, W
-		# Read Mask
-		y = Image.open(label_id)
-		y = [np.array(y)]
-		y = torch.tensor(y)
-		return x.squeeze(), y.squeeze()
+    def __init__(self, images, labels, height, width):
+    	self.images = images
+    	self.labels = labels
+    	self.height = height
+    	self.width = width  
+    def __len__(self):
+    	return len(self.images)
+    #@profile
+    def transforms(self, image, lbl):   
+        # Random horizontal flipping
+        if random.random() > 0.5:
+            image = TF.hflip(image)
+            lbl = TF.hflip(lbl)   
 
+        angle = int(np.random.choice([5,15,25],1,replace=True)) #Only pi/2 rotation
+        image = TF.rotate(image,angle=angle,expand=False, fill=-1)
+        lbl = TF.rotate(lbl,angle=angle,expand=False, fill=-1)
+        #flip
+        if random.random() > 0.5:
+            image = TF.hflip(image)
+            lbl = TF.hflip(lbl)
+        #adjust hue
+        image = TF.adjust_hue(image, 0.2)
+        #saturation
+        image = TF.adjust_saturation(image, random.uniform(0,2))
+        #brightness
+        image = TF.adjust_brightness(image, random.uniform(0.5, 2))
+        #sharpness    
+        image = TF.adjust_contrast(image, random.uniform(0.5, 2)) 
+        image = [np.array(image)]
+        image = np.stack(image, axis=2)
+        image = torch.tensor(image).transpose(0, 2).transpose(1, 3) # Convert to N, C, H, W
+
+        lbl = [np.array(lbl)]
+        lbl = torch.tensor(lbl)
+        resize = T.Resize((384,384))
+        image = resize(image)
+        lbl = resize(lbl)
+
+        return image, lbl
+    #@profile
+    def __getitem__(self, index):
+        image_id = self.images[index]
+        label_id = self.labels[index] 
+        # Read Image
+        x = Image.open(image_id)
+        y = Image.open(label_id)  
+        x,y = self.transforms(x,y)
+    
+        return x.squeeze(), y.squeeze()
+#@profile
 def decode_segmap(image, color_dict):
     label_colours = np.array([
 		color_dict['obj0'], color_dict['obj1'],
@@ -246,7 +282,7 @@ def decode_segmap(image, color_dict):
     rgb[:, :, 1] = g
     rgb[:, :, 2] = r
     return rgb
-
+#@profile
 def predict_rgb(model, tensor, color_dict):
     with torch.no_grad():
         out = model(tensor.float()).squeeze(0)
@@ -268,6 +304,7 @@ color_dict = {
     'obj11' : [0, 0, 0] # bicycles
 }
 
+#@profile
 def get_class_weights(loader, num_classes, c=1.02):
     _, y= next(iter(loader))
     y_flat = y.flatten()
@@ -275,8 +312,14 @@ def get_class_weights(loader, num_classes, c=1.02):
     p_class = each_class / len(y_flat)
     return 1 / (np.log(c + p_class))
 
+#@profile
 def train(model, train_dataloader, val_dataloader,device, criterion, optimizer, train_step_size, val_step_size,visualize_every, save_every, save_location, save_prefix, epochs):
-    metrics = 12
+    metrics = StreamSegMetrics(12)
+    torch.backends.cudnn.benchmark=True
+    
+    #define scaler for mixed precision
+    scaler = torch.cuda.amp.GradScaler()
+
     # Make sure that the checkpoint location exists
     try:
     	os.mkdir(save_location)
@@ -291,16 +334,18 @@ def train(model, train_dataloader, val_dataloader,device, criterion, optimizer, 
         train_loss = 0
         model.train()
         # Step Loop
-        for i in range(train_step_size):
-        	x_batch, y_batch = next(iter(train_dataloader))
-        	x_batch = x_batch.squeeze().to(device)
-        	y_batch = y_batch.squeeze().to(device)
-        	optimizer.zero_grad()
-        	out = model(x_batch.float())
-        	loss = criterion(out, y_batch.long())
-        	loss.backward()
-        	optimizer.step()
-        	train_loss += loss.item()
+        for i, (x_batch, y_batch) in enumerate(train_dataloader):
+            #x_batch, y_batch = next(iter(train_dataloader))
+            x_batch = x_batch.squeeze().to(device)
+            y_batch = y_batch.squeeze().to(device)
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                out = model(x_batch.float())
+                loss = criterion(out, y_batch.long())
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            train_loss += loss.item()
         train_loss_history.append(train_loss / train_step_size)
         print('\nTraining Loss: {}'.format(train_loss_history[-1]))
         print('Training Time: {} seconds'.format(time() - start))
@@ -333,20 +378,19 @@ def train(model, train_dataloader, val_dataloader,device, criterion, optimizer, 
     )
     return train_loss_history, val_loss_history 
 
-
+#@profile
 def main():
 
     print("checking device", "cuda:"+str(gpu_id))
     device = torch.device("cuda:"+str(gpu_id) if torch.cuda.is_available() else "cpu")
     print("using DEVICE", device)
 
-    train_images = sorted(glob('/local/DEEPLEARNING/camvid/train/*'))
-    train_labels = sorted(glob('/local/DEEPLEARNING/camvid/trainannot/*'))
-    val_images = sorted(glob('/local/DEEPLEARNING/camvid/val/*'))
-    val_labels = sorted(glob('/local/DEEPLEARNING/camvid/valannot/*'))
-    test_images = sorted(glob('/local/DEEPLEARNING/camvid/test/*'))
-    test_labels = sorted(glob('/local/DEEPLEARNING/camvid/testannot/*'))
-    batch_size = 10
+    train_images = sorted(glob('/share/DEEPLEARNING/datasets/camvid/train/*'))
+    train_labels = sorted(glob('/share/DEEPLEARNING/datasets/camvid/trainannot/*'))
+    val_images = sorted(glob('/share/DEEPLEARNING/datasets/camvid/val/*'))
+    val_labels = sorted(glob('/share/DEEPLEARNING/datasets/camvid/valannot/*'))
+    test_images = sorted(glob('/share/DEEPLEARNING/datasets/camvid/test/*'))
+    test_labels = sorted(glob('/share/DEEPLEARNING/datasets/camvid/testannot/*'))
 
     train_dataset = CamVidDataset(train_images, train_labels, 512, 512)
     print("length train", train_dataset.__len__())
@@ -359,16 +403,21 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
-
-    resnet50 = models.resnet50(pretrained=True)
-    resnet50_backbone = models._utils.IntermediateLayerGetter(resnet50, {'layer1': 'feat1', 'layer2': 'feat2', 'layer3': 'feat3', 'layer4': 'feat4'})
-    model = resvit.ResViT(pretrained_net=resnet50_backbone, num_class=12, dim=768, depth=1, heads=1, batch_size = batch_size, trans_img_size=(45,60))
-    print("created resvit model")
+    if model_name == "resvit":
+        resnet50 = models.resnet50(pretrained=True)
+        resnet50_backbone = models._utils.IntermediateLayerGetter(resnet50, {'layer1': 'feat1', 'layer2': 'feat2', 'layer3': 'feat3', 'layer4': 'feat4'})
+        model = resvit.ResViT(pretrained_net=resnet50_backbone, num_class=12, dim=768, depth=1, heads=1, batch_size = batch_size, trans_img_size=(45,60))
+        print("created resvit model")
+    else:
+        vit = timm.create_model('vit_base_patch16_384', pretrained=True)
+        vit_backbone = nn.Sequential(*list(vit.children())[:5])
+        model = setr.Setr(num_class=12, vit_backbone=vit_backbone, bilinear = False)
+    
     model.to(device)
     print("model put into ", device)
     class_weights = get_class_weights(train_loader, 12)
-    criterion = CrossEntropyLoss(weight=torch.FloatTensor(class_weights).to(device))
-    optimizer = Adam(
+    criterion = CrossEntropyLoss(weight=torch.FloatTensor(class_weights).to(device), ignore_index = 255)
+    optimizer = SGD(
         model.parameters(),
         lr=lr,
         weight_decay=wd
@@ -380,7 +429,7 @@ def main():
     device, criterion, optimizer,
     len(train_images) // batch_size,
     len(val_images) // batch_size, 5,
-    25, '/users/a/araujofj/camvid/checkpoints', 'resvit-model', epochs
+    25, '/users/a/araujofj/camvid/checkpoints', model_name, epochs
     )
 
     print("calculating performance on test set")
@@ -394,7 +443,6 @@ def main():
     plt.ylabel("Loss")
     plt.title("Loss function evolution")
     plt.savefig('loss_train.png')
-
 
 
 if __name__ == '__main__':
